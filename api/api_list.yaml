@@ -904,3 +904,24 @@
     - Patch
     - Update
     - List
+- api_packages:
+    - client: github.com/vmware/vsphere-automation-sdk-go/services/nsxt/infra/domains
+      model: github.com/vmware/vsphere-automation-sdk-go/services/nsxt/model
+      list_result_model: github.com/vmware/vsphere-automation-sdk-go/services/nsxt/model
+      type: Local
+    - client: github.com/vmware/vsphere-automation-sdk-go/services/nsxt-gm/global_infra/domains
+      model: github.com/vmware/vsphere-automation-sdk-go/services/nsxt/model
+      list_result_model: github.com/vmware/vsphere-automation-sdk-go/services/nsxt-gm/model
+      type: Global
+    - client: github.com/vmware/vsphere-automation-sdk-go/services/nsxt/orgs/projects/infra/domains
+      model: github.com/vmware/vsphere-automation-sdk-go/services/nsxt/model
+      list_result_model: github.com/vmware/vsphere-automation-sdk-go/services/nsxt/model
+      type: Multitenancy
+  model_name: PolicyFirewallFloodProtectionProfileBindingMapListResult
+  obj_name: PolicyFirewallFloodProtectionProfileBindingMapListResult
+  client_name: FirewallFloodProtectionProfileBindingMapsClient
+  list_result_name: PolicyFirewallFloodProtectionProfileBindingMapListResult
+  file_name: FirewallFloodProtectionProfileBindingMapsClient
+  supported_method:
+    - New
+    - List

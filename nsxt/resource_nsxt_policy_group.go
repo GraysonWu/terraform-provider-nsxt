@@ -127,6 +127,12 @@ func resourceNsxtPolicyGroup() *schema.Resource {
 				Optional:    true,
 				MaxItems:    1,
 			},
+			"firewall_flood_protection_profile_binding": {
+				Type:        schema.TypeList,
+				Description: "This entity will be used to establish association between Firewall Flood Protection profile and Group",
+				Elem:        getBindingProfileSchema(),
+				Optional:    true,
+			},
 		},
 	}
 }
@@ -313,6 +319,21 @@ func getExtendedCriteriaSetSchema() *schema.Resource {
 				Elem:        getIdentityGroupSchema(),
 				Optional:    true,
 			},
+		},
+	}
+}
+
+func getBindingProfileSchema() *schema.Resource {
+	return &schema.Resource{
+		Schema: map[string]*schema.Schema{
+			"sequence_number": {
+				Type:        schema.TypeInt,
+				Description: "This field is used to resolve conflicts when two profiles get applied to a single port",
+				Required:    true,
+			},
+			"profile_path":     getPolicyPathSchema(false, false, "Policy path for this profile resource"),
+			"binding_map_path": getComputedPolicyPathSchema("Policy path profile binding map"),
+			"revision":         getRevisionSchema(),
 		},
 	}
 }
@@ -806,6 +827,49 @@ func getIdentityGroupsData(expressions []*data.StructValue) ([]map[string]interf
 	return parsedIdentityGroups, nil
 }
 
+func nsxtPolicyGroupProfilesRead(d *schema.ResourceData, m interface{}) error {
+	// TODO: add other binding maps support, including:
+	// ChildDnsSecurityProfileBindingMap
+	// ChildGroupDiscoveryProfileBindingMap
+	// ChildGroupMonitoringProfileBindingMap
+	// ChildPolicyFirewallSessionTimerProfileBindingMap
+	err := nsxtPolicyGroupFirewallFloodProtectionProfileRead(d, m)
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func nsxtPolicyGroupFirewallFloodProtectionProfileRead(d *schema.ResourceData, m interface{}) error {
+	connector := getPolicyConnector(m)
+	var results model.PolicyFirewallFloodProtectionProfileBindingMapListResult
+	client := domains.NewFirewallFloodProtectionProfileBindingMapsClient(getSessionContext(d, m), connector)
+	var err error
+	results, err = client.List(nil, nil, nil, nil, nil, nil)
+	if err != nil {
+		return fmt.Errorf("Failed to read Firewall Flood Protection Profile Binding Map for group %s: %s", d.Id(), err)
+	}
+
+	config := make(map[string]interface{})
+	var configList []map[string]interface{}
+
+	for _, obj := range results.Results {
+		if obj.ParentPath != nil && *obj.ParentPath == d.Get("path").(string) {
+			config["sequence_number"] = obj.SequenceNumber
+			config["profile_path"] = obj.ProfilePath
+			config["binding_map_path"] = obj.Path
+			config["revision"] = obj.Revision
+			configList = append(configList, config)
+		}
+	}
+	if len(configList) > 0 {
+		d.Set("firewall_flood_protection_profile_binding", configList)
+	}
+
+	return nil
+}
+
 func validateGroupCriteriaAndConjunctions(criteriaSets []interface{}, conjunctions []interface{}) ([]criteriaMeta, error) {
 	if len(criteriaSets)+len(conjunctions) == 0 {
 		return nil, nil
@@ -837,6 +901,7 @@ func resourceNsxtPolicyGroupCreate(d *schema.ResourceData, m interface{}) error 
 		return err
 	}
 
+	domain := d.Get("domain").(string)
 	criteriaSets := d.Get("criteria").([]interface{})
 	conjunctions := d.Get("conjunction").([]interface{})
 
@@ -877,12 +942,21 @@ func resourceNsxtPolicyGroupCreate(d *schema.ResourceData, m interface{}) error 
 	if groupType != "" && nsxVersionHigherOrEqual("3.2.0") {
 		obj.GroupType = groupTypes
 	}
+	if needUseInfraPatch(d) {
+		// Create the resource using H-API PATCH
+		log.Printf("[INFO] Using H-API to create Group with ID %s", id)
+		err = nsxtPolicyGroupBindingMapSetInStruct(d, id, &obj)
+		if err != nil {
+			return err
+		}
+		err = groupInfraPatch(getSessionContext(d, m), obj, domain, m)
+	} else {
+		// Create the resource using PATCH
+		log.Printf("[INFO] Creating Group with ID %s", id)
+		client := domains.NewGroupsClient(getSessionContext(d, m), connector)
+		err = client.Patch(d.Get("domain").(string), id, obj)
+	}
 
-	client := domains.NewGroupsClient(getSessionContext(d, m), connector)
-	err = client.Patch(d.Get("domain").(string), id, obj)
-
-	// Create the resource using PATCH
-	log.Printf("[INFO] Creating Group with ID %s", id)
 	if err != nil {
 		return handleCreateError("Group", id, err)
 	}
@@ -891,6 +965,139 @@ func resourceNsxtPolicyGroupCreate(d *schema.ResourceData, m interface{}) error 
 	d.Set("nsx_id", id)
 
 	return resourceNsxtPolicyGroupRead(d, m)
+}
+
+func groupInfraPatch(context utl.SessionContext, group model.Group, domain string, m interface{}) error {
+	childDomain, err := createChildDomainWithGroup(domain, group)
+	if err != nil {
+		return fmt.Errorf("Failed to create H-API for Predefined Security Policy: %s", err)
+	}
+
+	var infraChildren []*data.StructValue
+	infraChildren = append(infraChildren, childDomain)
+
+	infraType := "Infra"
+	infraObj := model.Infra{
+		Children:     infraChildren,
+		ResourceType: &infraType,
+	}
+	return policyInfraPatch(context, infraObj, getPolicyConnector(m), false)
+}
+
+func createChildDomainWithGroup(domain string, policy model.Group) (*data.StructValue, error) {
+	converter := bindings.NewTypeConverter()
+
+	childGroup := model.ChildGroup{
+		ResourceType: "ChildGroup",
+		Group:        &policy,
+	}
+
+	dataValue, errors := converter.ConvertToVapi(childGroup, model.ChildGroupBindingType())
+	if len(errors) > 0 {
+		return nil, errors[0]
+	}
+
+	var domainChildren []*data.StructValue
+	domainChildren = append(domainChildren, dataValue.(*data.StructValue))
+
+	targetType := "Domain"
+	childDomain := model.ChildResourceReference{
+		Id:           &domain,
+		ResourceType: "ChildResourceReference",
+		TargetType:   &targetType,
+		Children:     domainChildren,
+	}
+
+	dataValue, errors = converter.ConvertToVapi(childDomain, model.ChildResourceReferenceBindingType())
+	if len(errors) > 0 {
+		return nil, errors[0]
+	}
+	return dataValue.(*data.StructValue), nil
+}
+
+func needUseInfraPatch(d *schema.ResourceData) bool {
+	return d.HasChange("firewall_flood_protection_profile_binding")
+}
+
+func nsxtPolicyGroupBindingMapSetInStruct(d *schema.ResourceData, groupID string, group *model.Group) error {
+	group.Id = &groupID
+	groupType := "Group"
+	group.ResourceType = &groupType
+
+	var children []*data.StructValue
+
+	// TODO: add other binding maps support, including:
+	// ChildDnsSecurityProfileBindingMap
+	// ChildGroupDiscoveryProfileBindingMap
+	// ChildGroupMonitoringProfileBindingMap
+	// ChildPolicyFirewallSessionTimerProfileBindingMap
+	child, err := nsxtPolicyGroupFirewallFloodProtectionProfileSetInStruct(d)
+	if err != nil {
+		return err
+	}
+
+	if child != nil {
+		children = append(children, child)
+	}
+	group.Children = children
+
+	return nil
+}
+
+func nsxtPolicyGroupFirewallFloodProtectionProfileSetInStruct(d *schema.ResourceData) (*data.StructValue, error) {
+	groupProfileMapID := "default"
+	floodProtectionProfilePath := ""
+	sequenceNum := int64(0)
+	revision := int64(0)
+	oldProfiles, newProfiles := d.GetChange("firewall_flood_protection_profile_binding")
+	shouldDelete := false
+	if len(newProfiles.([]interface{})) > 0 {
+		profileMap := newProfiles.([]interface{})[0].(map[string]interface{})
+		floodProtectionProfilePath = profileMap["profile_path"].(string)
+		sequenceNum = int64(profileMap["sequence_number"].(int))
+		if len(profileMap["binding_map_path"].(string)) > 0 {
+			groupProfileMapID = getPolicyIDFromPath(profileMap["binding_map_path"].(string))
+		}
+		revision = int64(profileMap["revision"].(int))
+	} else {
+		if len(oldProfiles.([]interface{})) == 0 {
+			return nil, nil
+		}
+		// Profile should be deleted
+		groupProfileMapID, revision = getOldProfileDataForRemoval(oldProfiles)
+		shouldDelete = true
+	}
+
+	resourceType := "PolicyFirewallFloodProtectionProfileBindingMap"
+	bindingMap := model.PolicyFirewallFloodProtectionProfileBindingMap{
+		ResourceType:   &resourceType,
+		SequenceNumber: &sequenceNum,
+		Id:             &groupProfileMapID,
+	}
+
+	if len(oldProfiles.([]interface{})) > 0 {
+		// This is an update
+		bindingMap.Revision = &revision
+	}
+
+	if len(floodProtectionProfilePath) > 0 {
+		bindingMap.ProfilePath = &floodProtectionProfilePath
+	}
+
+	childConfig := model.ChildPolicyFirewallFloodProtectionProfileBindingMap{
+		ResourceType: "ChildPolicyFirewallFloodProtectionProfileBindingMap",
+		PolicyFirewallFloodProtectionProfileBindingMap: &bindingMap,
+		Id:              &groupProfileMapID,
+		MarkedForDelete: &shouldDelete,
+	}
+
+	converter := bindings.NewTypeConverter()
+	dataValue, errors := converter.ConvertToVapi(childConfig, model.ChildPolicyFirewallFloodProtectionProfileBindingMapBindingType())
+	if errors != nil {
+		return nil, fmt.Errorf("Error converting child policy firewall flood protection profile binding map: %v", errors[0])
+	}
+
+	return dataValue.(*data.StructValue), nil
 }
 
 func resourceNsxtPolicyGroupRead(d *schema.ResourceData, m interface{}) error {
@@ -936,8 +1143,7 @@ func resourceNsxtPolicyGroupRead(d *schema.ResourceData, m interface{}) error {
 		extendedCriteria = append(extendedCriteria, identityGroupsMap)
 	}
 	d.Set("extended_criteria", extendedCriteria)
-
-	return nil
+	return nsxtPolicyGroupProfilesRead(d, m)
 }
 
 func resourceNsxtPolicyGroupUpdate(d *schema.ResourceData, m interface{}) error {
@@ -948,6 +1154,7 @@ func resourceNsxtPolicyGroupUpdate(d *schema.ResourceData, m interface{}) error 
 		return fmt.Errorf("Error obtaining Group ID")
 	}
 
+	domain := d.Get("domain").(string)
 	criteriaSets := d.Get("criteria").([]interface{})
 	conjunctions := d.Get("conjunction").([]interface{})
 
@@ -991,10 +1198,21 @@ func resourceNsxtPolicyGroupUpdate(d *schema.ResourceData, m interface{}) error 
 		obj.GroupType = groupTypes
 	}
 
-	client := domains.NewGroupsClient(getSessionContext(d, m), connector)
+	if needUseInfraPatch(d) {
+		// Update the resource using H-API PATCH
+		log.Printf("[INFO] Using H-API to update Group with ID %s", id)
+		err = nsxtPolicyGroupBindingMapSetInStruct(d, id, &obj)
+		if err != nil {
+			return err
+		}
+		err = groupInfraPatch(getSessionContext(d, m), obj, domain, m)
+	} else {
+		// Update the resource using PATCH
+		log.Printf("[INFO] Updating Group with ID %s", id)
+		client := domains.NewGroupsClient(getSessionContext(d, m), connector)
+		err = client.Patch(d.Get("domain").(string), id, obj)
+	}
 
-	// Update the resource using PATCH
-	err = client.Patch(d.Get("domain").(string), id, obj)
 	if err != nil {
 		return handleUpdateError("Group", id, err)
 	}
